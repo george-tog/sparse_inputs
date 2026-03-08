@@ -408,8 +408,9 @@ def plot_psychometric_curve(results_df, model_params=None, savepath=None, show_p
     Plot a psychometric curve of average performance versus target concentration.
 
     This function groups the raw performance data (ignoring background complexity)
-    by target cue concentration (averaging across all n_bg values and mice) and plots the
-    average accuracy as a function of target concentration on a log-scaled x-axis.
+    by target cue concentration (averaging across all n_bg values and datasets) and plots the
+    mean accuracy as a function of target concentration on a log-scaled x-axis, with a
+    shaded region showing mean +/- SEM.
 
     Parameters
     ----------
@@ -420,14 +421,56 @@ def plot_psychometric_curve(results_df, model_params=None, savepath=None, show_p
     savepath : str, optional
         File path to save the figure. If provided, the figure is saved at this location.
     """
-    # Group by target_conc only and compute the mean accuracy.
-    psych_df = results_df.groupby('target_conc')['correct'].mean().reset_index()
+    # Compute psychometric mean/SEM per target concentration.
+    # If dataset labels exist, first average across n_bg within each dataset to
+    # avoid treating each n_bg point as an independent replicate.
+    if 'dataset' in results_df.columns:
+        dataset_level = (
+            results_df
+            .groupby(['target_conc', 'dataset'], as_index=False)['correct']
+            .mean()
+        )
+        psych_df = (
+            dataset_level
+            .groupby('target_conc', as_index=False)['correct']
+            .agg(['mean', 'sem'])
+            .reset_index()
+            .sort_values('target_conc')
+        )
+    else:
+        psych_df = (
+            results_df
+            .groupby('target_conc', as_index=False)['correct']
+            .agg(['mean', 'sem'])
+            .reset_index()
+            .sort_values('target_conc')
+        )
+    psych_df['sem'] = psych_df['sem'].fillna(0.0)
 
-    plt.figure(figsize=(6, 4))
-    plt.plot(psych_df['target_conc'], psych_df['correct'], '.-', markersize=10)
+    colors = [
+            "#9d7dd0",
+            "#5e78dd",
+            "#86d6d3",
+            "#7dcc66",
+            "#acd05b",
+            "#efd962",
+            "#dc9c4f",
+            "#bd6f6d",
+            "#c37ab4"
+        ]
+    plt.figure(figsize=(4, 4))
+    plt.plot(psych_df['target_conc'], psych_df['mean'], '.-', markersize=10, c=colors[0])
+    plt.fill_between(
+        psych_df['target_conc'],
+        psych_df['mean'] - psych_df['sem'],
+        psych_df['mean'] + psych_df['sem'],
+        color=colors[0],
+        alpha=0.25
+    )
     plt.xscale('log')
     plt.xlabel("Target Concentration")
-    plt.ylabel("Average Performance")
+    plt.ylabel("Average Performance (%)")
+    plt.yticks([0.5, 0.75, 1.0], labels=[50, 75, 100])
     if model_params is not None:
         title_str = (f"Train Cue Conc: {model_params['train_cue_conc']}, BG Conc: {model_params['bg_conc']}, "
                      f"$\\rho$: {model_params['rho']}")
@@ -548,7 +591,7 @@ def population_sparsity(resp):
     returns: np.array with shape (odors,)
     """
     N_glom = resp.shape[0]
-    prefactor = 1  # / (1 - 1 / N_glom)
+    prefactor = 1 / (1 - 1 / N_glom)
     numerator = np.mean(resp, axis=0) ** 2
     denominator = np.mean(resp ** 2, axis=0)
     return prefactor * (1 - numerator / denominator)
