@@ -341,6 +341,18 @@ def plot_performance_curves(results_df, model_params=None, savepath=None, show_p
     savepath : str, optional
         File path to save the figure. If provided, the figure is saved to this location.
     """
+    colors = [
+        "#9d7dd0",
+        "#5e78dd",
+        "#86d6d3",
+        "#7dcc66",
+        "#acd05b",
+        "#efd962",
+        "#dc9c4f",
+        "#bd6f6d",
+        "#c37ab4"
+    ]
+
     # Group over all mice for each combination of target_conc and n_bg,
     # and compute both the mean accuracy and its SEM.
     summary = results_df.groupby(['target_conc', 'n_bg'])['correct'].agg(['mean', 'sem']).reset_index()
@@ -355,10 +367,7 @@ def plot_performance_curves(results_df, model_params=None, savepath=None, show_p
         raise ValueError("More than 16 unique target cue concentrations provided. Maximum allowed is 16.")
 
     # Generate distinct colors for each target cue concentration.
-    # colors = sns.color_palette("hsv", len(unique_cues))
-    colors = sns.color_palette("husl", 16)
-
-    sns.set_context("paper", font_scale=1.5)
+    sns.set_context("paper", font_scale=1.7)
 
     # Plot the performance curve for each cue concentration.
     for i, cue_conc in enumerate(unique_cues):
@@ -367,8 +376,10 @@ def plot_performance_curves(results_df, model_params=None, savepath=None, show_p
         plt.fill_between(sub['n_bg'], sub['mean'] - sub['sem'], sub['mean'] + sub['sem'],
                          alpha=0.3, color=colors[i])
 
-    plt.xlabel('Number of Background Odors Activated (n_bg)')
-    plt.ylabel('Decoder Accuracy')
+    plt.xlabel('Background #')
+    plt.ylabel('Decoder Accuracy (%)')
+
+    plt.yticks([0.5, 0.75, 1.0], [50, 75, 100])
 
     # Add model parameters to the title if provided.
     if model_params is not None:
@@ -377,7 +388,7 @@ def plot_performance_curves(results_df, model_params=None, savepath=None, show_p
     else:
         title_str = "Decoder Performance"
     plt.title(title_str)
-    plt.legend(title='Target Cue Conc', loc='center left', bbox_to_anchor=(1, 0.5), frameon=False)
+    plt.legend(title='Target Odor\nConcentration', loc='center left', bbox_to_anchor=(1, 0.5), frameon=False)
     sns.despine()
     plt.tight_layout()
 
@@ -546,7 +557,7 @@ def plot_matched_conc_performance_curves(results_df, model_params=None, savepath
         plt.fill_between(sub['n_bg'], sub['mean'] - sub['sem'], sub['mean'] + sub['sem'],
                             alpha=0.3, color=colors[i])
 
-    plt.xlabel('# Background Odors')    
+    plt.xlabel('Background #')    
     plt.ylabel('Decoder Accuracy (%)')
     plt.yticks(ticks=[0.5, 0.75, 1.00], labels=[50, 75, 100])
 
@@ -561,7 +572,7 @@ def plot_matched_conc_performance_curves(results_df, model_params=None, savepath
     else:
         title_str = "Decoder Performance"
     # plt.title(title_str)
-    plt.legend(title='Cue concentration', loc='center left', bbox_to_anchor=(1, 0.5), frameon=False)
+    plt.legend(title='Target Odor\nConcentration', loc='center left', bbox_to_anchor=(1, 0.5), frameon=False)
     sns.despine()
     plt.tight_layout()
 
