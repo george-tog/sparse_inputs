@@ -5,8 +5,102 @@ import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
 import seaborn as sns
 import os
+import errno
+import tempfile
+import time
 
-def init_model_parameters(total_bg=16, N=20, rho=1.0, bg_conc=1e-2, F_max=1, n=4, train_cue_conc=None, seed=42):
+
+def _safe_to_csv(df, path, index=False, max_retries=5, base_sleep_s=0.2):
+    """
+    Robust CSV writer for parallel workers on synced/network-backed folders.
+    Writes to a temp file in the target directory and atomically replaces.
+    """
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    for attempt in range(max_retries):
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".tmp_csv_", suffix=".csv", dir=out_dir or ".")
+        os.close(tmp_fd)
+        try:
+            df.to_csv(tmp_path, index=index)
+            os.replace(tmp_path, path)
+            return
+        except OSError as err:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            retryable = err.errno in {errno.ECANCELED, errno.EBUSY, errno.EINTR}
+            if (not retryable) or (attempt == max_retries - 1):
+                raise
+            time.sleep(base_sleep_s * (attempt + 1))
+
+
+def _build_figure_savepath(savepath, F_max=None, noise_desc=None, model_params=None):
+    """
+    Build a deterministic figure save path and avoid duplicate suffix tokens.
+    If legacy noise_desc='noise_fano1' is provided, include sigma when available.
+    """
+    if F_max is None and model_params is not None:
+        F_max = model_params.get("F_max", None)
+    
+    if noise_desc is not None and model_params is not None:
+        fano = model_params.get("fano_factor", None)
+
+    # Back-compat: old label -> new canonical label
+    if noise_desc in {"noise_fano1", "noise_fano"}:
+        if fano is None:
+            fano = 1.0
+        noise_desc = f"noise_fano_{fano:.2e}"
+
+
+    base, ext = os.path.splitext(savepath)
+    tokens = []
+    if F_max is not None:
+        fmax_token = f"Fmax_{F_max}"
+        if fmax_token not in base:
+            tokens.append(fmax_token)
+    base_has_fano = ("noise_fano_" in base) or ("noise_fano1" in base)
+    if noise_desc is not None and noise_desc not in base:
+        if not (noise_desc.startswith("noise_fano_") and base_has_fano):
+            tokens.append(noise_desc)
+
+    if tokens:
+        return f"{base}_{'_'.join(tokens)}{ext}"
+    return savepath
+
+
+def _safe_savefig(path, max_retries=5, base_sleep_s=0.2, **savefig_kwargs):
+    """
+    Robust figure writer for parallel workers on synced/network-backed folders.
+    Saves to a temp file in target directory and atomically replaces.
+    """
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    suffix = os.path.splitext(path)[1] or ".tmp"
+    for attempt in range(max_retries):
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".tmp_fig_", suffix=suffix, dir=out_dir or ".")
+        os.close(tmp_fd)
+        try:
+            plt.savefig(tmp_path, **savefig_kwargs)
+            os.replace(tmp_path, path)
+            return
+        except OSError as err:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            retryable = err.errno in {errno.ECANCELED, errno.EBUSY, errno.EINTR}
+            if (not retryable) or (attempt == max_retries - 1):
+                raise
+            time.sleep(base_sleep_s * (attempt + 1))
+
+def init_model_parameters(total_bg=16, N=20, rho=1.0, bg_conc=1e-2, F_max=1, n=4, fano_factor=1.0, train_cue_conc=None, seed=42):
     """
     Initialize model parameters.
     """
@@ -33,7 +127,8 @@ def init_model_parameters(total_bg=16, N=20, rho=1.0, bg_conc=1e-2, F_max=1, n=4
         "lnkappa": lnkappa,
         "lneta": lneta,
         "kappa": kappa,
-        "eta": eta
+        "eta": eta,
+        "fano_factor": fano_factor
     }
 
 def generate_odor_vecs_vectorized(samples, cue_concs, bg_conc, cue=-1, n_bg=-1, total_bg=16):
@@ -95,7 +190,7 @@ def compute_eta_mix_vec(concs, kappa, eta, inv_kappa=None):
     eta_mix = k_mix * np.sum(eta_expanded * betas * inv_kappa_expanded, axis=1)
     return eta_mix
 
-def compute_activity_vec(concs, kappa, eta, F_max, n, sigma=0.0, inv_kappa=None, fano_factor_one=False):
+def compute_activity_vec(concs, kappa, eta, F_max, n, sigma=0.0, fano_factor=1.0, inv_kappa=None, fano_factor_one=False):
     """
     Compute glomerular activity responses for a batch of samples.
     If `fano_factor_one` is True, add heteroscedastic Gaussian noise with
@@ -107,7 +202,7 @@ def compute_activity_vec(concs, kappa, eta, F_max, n, sigma=0.0, inv_kappa=None,
     activity = F_max / (1 + ((1 + C / k_mix) / (eta_mix * C / k_mix)) ** n)
     if fano_factor_one:
         # variance equals mean; std = sqrt(mean response)
-        std = np.sqrt(np.clip(activity, 0.0, None))
+        std = np.sqrt(fano_factor * np.clip(activity, 0.0, None)) # scale noise by fano_factor
         activity += np.random.normal(0.0, std, size=activity.shape)
     elif sigma > 0.0:
         activity += np.random.normal(0.0, sigma, size=activity.shape)
@@ -115,14 +210,14 @@ def compute_activity_vec(concs, kappa, eta, F_max, n, sigma=0.0, inv_kappa=None,
 
 
 def generate_datasets(n_train=3000, n_test=3000, cue_concs=None, train_cue_conc=None,
-                      sigma=0.1, cue=-1, n_bg=-1, model_params=None, return_params=False, fano_factor_one=False):
+                      sigma=0.1, cue=-1, n_bg=-1, fano_factor=1.0, model_params=None, return_params=False, fano_factor_one=False):
     """
     Generate training and test datasets.
 
     If `fano_factor_one` is True, Gaussian noise std is set to sqrt(mean response) (Fano = 1); otherwise a fixed `sigma` is used.
     """
     if model_params is None:
-        model_params = init_model_parameters()
+        model_params = init_model_parameters(fano_factor=fano_factor)
     total_bg = model_params["total_bg"]
     bg_conc = model_params["bg_conc"]
     N = model_params["N"]
@@ -152,7 +247,7 @@ def generate_datasets(n_train=3000, n_test=3000, cue_concs=None, train_cue_conc=
         )
         train_conc_tensor = tensorize_concs(X_train_odor, total_train_samples, b, N)
         train_responses = compute_activity_vec(
-            train_conc_tensor, kappa, eta, F_max, n, sigma, inv_kappa=inv_kappa, fano_factor_one=fano_factor_one
+            train_conc_tensor, kappa, eta, F_max, n, sigma, inv_kappa=inv_kappa, fano_factor_one=fano_factor_one, fano_factor=fano_factor
         )
         X_train = train_responses.reshape(L, n_train, -1)
         y_train = y_train.reshape(L, n_train)
@@ -164,7 +259,7 @@ def generate_datasets(n_train=3000, n_test=3000, cue_concs=None, train_cue_conc=
         )
         X_train_tensor = tensorize_concs(X_train_odor, n_train, b, N)
         train_responses = compute_activity_vec(
-            X_train_tensor, kappa, eta, F_max, n, sigma, inv_kappa=inv_kappa, fano_factor_one=fano_factor_one
+            X_train_tensor, kappa, eta, F_max, n, sigma, inv_kappa=inv_kappa, fano_factor_one=fano_factor_one, fano_factor=fano_factor
         )
         X_train = train_responses.reshape(n_train, -1)
 
@@ -176,7 +271,7 @@ def generate_datasets(n_train=3000, n_test=3000, cue_concs=None, train_cue_conc=
     test_cue_concs_vector = np.repeat(cue_concs, n_test)
     X_test_odor, y_test = generate_odor_vecs_vectorized(total_test_samples, test_cue_concs_vector, bg_conc, cue=cue, n_bg=n_bg, total_bg=total_bg)
     test_conc_tensor = tensorize_concs(X_test_odor, total_test_samples, b, N)
-    test_responses = compute_activity_vec(test_conc_tensor, kappa, eta, F_max, n, sigma, inv_kappa=inv_kappa, fano_factor_one=fano_factor_one)
+    test_responses = compute_activity_vec(test_conc_tensor, kappa, eta, F_max, n, sigma, inv_kappa=inv_kappa, fano_factor_one=fano_factor_one, fano_factor=fano_factor)
     X_tests = test_responses.reshape(L, n_test, -1)
     y_tests = y_test.reshape(L, n_test)
     all_test_concs = X_test_odor.reshape(L, n_test, -1)
@@ -198,16 +293,18 @@ def pure_cue_responses(X_tests, y_tests, n_bg_vals):
     one_mask = (labels == 1)
     return cue_responses[~one_mask], cue_responses[one_mask]
 
-def run_decoder_experiments_k_datasets(k, n_train, n_test, cue_concs, sigma, cue, train_cue_conc, n_bg, model_params, clf_params, penalty, F_max=None, fano_factor_one=False):
+def run_decoder_experiments_k_datasets(k, n_train, n_test, cue_concs, sigma, cue, train_cue_conc, n_bg, model_params, clf_params, penalty, F_max=None, fano_factor_one=False, fano_factor=1.0):
     """
     Generate k datasets and run a decoder experiment on each. Saves performance and weight files.
     """
-    # Override F_max in model_params if provided; also keep a local copy for filenames
+    # Keep a local copy for filenames/plot metadata and avoid mutating caller state.
+    model_params = dict(model_params)
+    model_params['fano_factor'] = fano_factor
     if F_max is not None:
-        model_params = dict(model_params)  # avoid mutating the caller's dict
         model_params['F_max'] = F_max
     else:
         F_max = model_params.get('F_max', 1)
+    model_params['sigma'] = sigma
     results = []
     training_performance = []
     weights_list = []
@@ -222,7 +319,8 @@ def run_decoder_experiments_k_datasets(k, n_train, n_test, cue_concs, sigma, cue
             n_bg=n_bg,
             model_params=model_params,
             return_params=False,
-            fano_factor_one=fano_factor_one
+            fano_factor_one=fano_factor_one,
+            fano_factor=fano_factor
         )
 
         if not np.isscalar(train_cue_conc):  # training at multiple target concentrations
@@ -265,7 +363,7 @@ def run_decoder_experiments_k_datasets(k, n_train, n_test, cue_concs, sigma, cue
         results.append(grouped)
     results_df = pd.concat(results, ignore_index=True)
 
-    noise_desc = "noise_fano1" if fano_factor_one else f"noise_fixed_sigma_{sigma}"
+    noise_desc = f"noise_fano_{fano_factor:.2e}" if fano_factor_one else f"noise_fixed_sigma_{sigma}"
     if np.isscalar(train_cue_conc):
         df_savepath = (
             f"../results/target_bg_conc_noise_grid/{penalty}/performance_{penalty}_trainconc_{train_cue_conc:.2e}_"
@@ -280,7 +378,7 @@ def run_decoder_experiments_k_datasets(k, n_train, n_test, cue_concs, sigma, cue
         )
 
 
-    results_df.to_csv(df_savepath, index=False)
+    _safe_to_csv(results_df, df_savepath, index=False)
 
     train_df = pd.DataFrame(training_performance)
 
@@ -298,7 +396,7 @@ def run_decoder_experiments_k_datasets(k, n_train, n_test, cue_concs, sigma, cue
         )
 
 
-    train_df.to_csv(train_savepath, index=False)
+    _safe_to_csv(train_df, train_savepath, index=False)
 
     weights_df = pd.DataFrame(weights_list)
     if np.isscalar(train_cue_conc):
@@ -315,7 +413,7 @@ def run_decoder_experiments_k_datasets(k, n_train, n_test, cue_concs, sigma, cue
         )
 
 
-    weights_df.to_csv(weights_savepath_csv, index=False)
+    _safe_to_csv(weights_df, weights_savepath_csv, index=False)
 
     return results_df
 
@@ -357,7 +455,7 @@ def plot_performance_curves(results_df, model_params=None, savepath=None, show_p
     # and compute both the mean accuracy and its SEM.
     summary = results_df.groupby(['target_conc', 'n_bg'])['correct'].agg(['mean', 'sem']).reset_index()
 
-    plt.figure(figsize=(7, 5))
+    plt.figure(figsize=(7, 5), dpi=600)
 
     # Get unique target cue concentrations and sort them.
     unique_cues = sorted(summary['target_conc'].unique())
@@ -384,7 +482,7 @@ def plot_performance_curves(results_df, model_params=None, savepath=None, show_p
     # Add model parameters to the title if provided.
     if model_params is not None:
         title_str = (f"Train Cue Conc: {model_params['train_cue_conc']}, BG Conc: {model_params['bg_conc']}, "
-                     f"$\\rho$: {model_params['rho']}, receptors: {model_params['N']**2}")
+                     f"$\\rho$: {model_params['rho']}, FF: {model_params['fano_factor']}")
     else:
         title_str = "Decoder Performance"
     plt.title(title_str)
@@ -393,25 +491,42 @@ def plot_performance_curves(results_df, model_params=None, savepath=None, show_p
     plt.tight_layout()
 
     if savepath is not None:
-        # derive F_max if not provided
-        if F_max is None and model_params is not None:
-            F_max = model_params.get('F_max', None)
-        final_savepath = savepath
-        tokens = []
-        if F_max is not None:
-            tokens.append(f"Fmax_{F_max}")
-        if noise_desc is not None:
-            tokens.append(noise_desc)
-        if tokens:
-            base, ext = os.path.splitext(savepath)
-            final_savepath = f"{base}_{'_'.join(tokens)}{ext}"
-        plt.savefig(final_savepath, bbox_inches='tight')
+        final_savepath = _build_figure_savepath(
+            savepath,
+            F_max=F_max,
+            noise_desc=noise_desc,
+            model_params=model_params
+        )
+        _safe_savefig(final_savepath, bbox_inches='tight')
         print(f"Figure saved to {final_savepath}")
     else:
         plt.show()
 
     if not show_plot:
         plt.close()
+
+def psychometric_summary(df):
+    # Match your newer plot_psychometric_curve behavior:
+    # average within dataset first if dataset labels exist.
+    if "dataset" in df.columns:
+        dataset_level = (
+            df.groupby(["target_conc", "dataset"], as_index=False)["correct"]
+            .mean()
+        )
+        out = (
+            dataset_level.groupby("target_conc")["correct"]
+            .agg(mean="mean", sem="sem")
+            .reset_index()
+        )
+    else:
+        out = (
+            df.groupby("target_conc")["correct"]
+            .agg(mean="mean", sem="sem")
+            .reset_index()
+        )
+
+    out["sem"] = out["sem"].fillna(0.0)
+    return out.sort_values("target_conc")
 
 
 def plot_psychometric_curve(results_df, model_params=None, savepath=None, show_plot=True, noise_desc=None, F_max=None):
@@ -469,7 +584,9 @@ def plot_psychometric_curve(results_df, model_params=None, savepath=None, show_p
             "#bd6f6d",
             "#c37ab4"
         ]
-    plt.figure(figsize=(4, 4))
+    plt.figure(figsize=(4, 4), dpi=600)
+    sns.set_context("paper", font_scale=1.7)
+
     plt.plot(psych_df['target_conc'], psych_df['mean'], '.-', markersize=10, c=colors[0])
     plt.fill_between(
         psych_df['target_conc'],
@@ -487,23 +604,18 @@ def plot_psychometric_curve(results_df, model_params=None, savepath=None, show_p
                      f"$\\rho$: {model_params['rho']}")
     else:
         title_str = "Psychometric Curve"
-    plt.title(title_str)
+    plt.title(title_str, pad=10)
     sns.despine()
-    plt.tight_layout()
+    # plt.tight_layout()
 
     if savepath is not None:
-        if F_max is None and model_params is not None:
-            F_max = model_params.get('F_max', None)
-        final_savepath = savepath
-        tokens = []
-        if F_max is not None:
-            tokens.append(f"Fmax_{F_max}")
-        if noise_desc is not None:
-            tokens.append(noise_desc)
-        if tokens:
-            base, ext = os.path.splitext(savepath)
-            final_savepath = f"{base}_{'_'.join(tokens)}{ext}"
-        plt.savefig(final_savepath, bbox_inches='tight')
+        final_savepath = _build_figure_savepath(
+            savepath,
+            F_max=F_max,
+            noise_desc=noise_desc,
+            model_params=model_params
+        )
+        _safe_savefig(final_savepath, bbox_inches='tight')
         print(f"Psychometric curve saved to {final_savepath}")
     else:
         plt.show()
@@ -516,7 +628,7 @@ def plot_matched_conc_performance_curves(results_df, model_params=None, savepath
     results_df: dataframe where training and testing concentrations are matched
     '''
     summary = results_df.groupby(['target_conc', 'n_bg'])['correct'].agg(['mean', 'sem']).reset_index()
-    plt.figure(figsize=(8,6), dpi=600)
+    plt.figure(figsize=(7,5), dpi=600)
     sns.set_context("paper", font_scale=1.7)
 
     summary = results_df.groupby(['target_conc', 'n_bg'])['correct'].agg(['mean', 'sem']).reset_index()
@@ -553,7 +665,7 @@ def plot_matched_conc_performance_curves(results_df, model_params=None, savepath
     # Plot the performance curve for each cue concentration.
     for i, cue_conc in enumerate(unique_cues):
         sub = summary[summary['target_conc'] == cue_conc].sort_values('n_bg')
-        plt.plot(sub['n_bg'], sub['mean'], label=f'{cue_conc:.1e}', color=colors[i], linestyle=line_styles[0])
+        plt.plot(sub['n_bg'], sub['mean'], label=f'{cue_conc:.2e}', color=colors[i], linestyle=line_styles[0])
         plt.fill_between(sub['n_bg'], sub['mean'] - sub['sem'], sub['mean'] + sub['sem'],
                             alpha=0.3, color=colors[i])
 
@@ -571,24 +683,19 @@ def plot_matched_conc_performance_curves(results_df, model_params=None, savepath
                         f"$\\rho$: {model_params['rho']}, sigma: {model_params['sigma']}, receptors: {model_params['N']**2}")
     else:
         title_str = "Decoder Performance"
-    # plt.title(title_str)
+    plt.title("Matched train-test target conc")
     plt.legend(title='Target Odor\nConcentration', loc='center left', bbox_to_anchor=(1, 0.5), frameon=False)
     sns.despine()
     plt.tight_layout()
 
     if savepath is not None:
-        if F_max is None and model_params is not None:
-            F_max = model_params.get('F_max', None)
-        final_savepath = savepath
-        tokens = []
-        if F_max is not None:
-            tokens.append(f"Fmax_{F_max}")
-        if noise_desc is not None:
-            tokens.append(noise_desc)
-        if tokens:
-            base, ext = os.path.splitext(savepath)
-            final_savepath = f"{base}_{'_'.join(tokens)}{ext}"
-        plt.savefig(final_savepath, bbox_inches='tight', dpi=600)
+        final_savepath = _build_figure_savepath(
+            savepath,
+            F_max=F_max,
+            noise_desc=noise_desc,
+            model_params=model_params
+        )
+        _safe_savefig(final_savepath, bbox_inches='tight', dpi=600)
         print(f"Figure saved to {final_savepath}")
     else:
         plt.show()
@@ -606,3 +713,30 @@ def population_sparsity(resp):
     numerator = np.mean(resp, axis=0) ** 2
     denominator = np.mean(resp ** 2, axis=0)
     return prefactor * (1 - numerator / denominator)
+
+def participation_ratio(resp):
+    """
+    resp: np.array with shape (glomeruli, odors)
+    returns: np.array with shape (odors,)
+    """
+    denominator = np.sum(resp ** 4, axis=0)
+    numerator = np.power(np.sum(resp ** 2, axis=0), 2)
+    return numerator / denominator
+
+def PR_sparsity(resp):
+    """
+    resp: np.array with shape (glomeruli, odors)
+    returns: np.array with shape (odors,)
+    """
+    N_glom = resp.shape[0]
+    return (N_glom - participation_ratio(resp)) / (N_glom - 1)
+
+def hoyer_sparsity(resp):
+    """
+    resp: np.array with shape (glomeruli, odors)
+    returns: np.array with shape (odors,)
+    """
+    N_glom = resp.shape[0]
+    numerator = np.sqrt(N_glom) - np.sum(np.abs(resp), axis=0) / np.linalg.norm(resp, axis=0)
+    denominator = np.sqrt(N_glom) - 1
+    return numerator / denominator
