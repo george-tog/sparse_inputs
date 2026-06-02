@@ -1,6 +1,4 @@
-from setuptools import find_packages, setup
+from setuptools import setup
 
-setup(
-    name="odor_mix_code",
-    packages=find_packages(),
-)
+
+setup()

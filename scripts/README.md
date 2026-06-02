@@ -1,13 +1,49 @@
-# Scripts
+# Notebook Execution Guide
 
-1-all_decoding.ipynb (Fig 3B-F, S5)
+Run these notebooks with the `odor-mix-code` environment described in the top-level `README.md`. They use `odor_mix_code.paths` for project-relative `data/`, `results/`, and `figures/` paths.
 
-2-glue_analysis.ipynb (Fig4) - depends on ../results/GLUE/glomerular_gcmc_withshuffle_24bg_high_low_scale_0.0_10000points.csv if GLUE package is not public
+## Recommended Order
 
-3-OSN-PiC_data.ipynb (Fig S7B): one vs rest logistic regression and computes response sparsity 
+1. `5-glom_data_sparsity.ipynb`
+   - Generates Fig. 3A and Fig. S6.
+   - Inputs: `data/Zak_2020/Glomerular_Matrix.mat`, `data/Burton_2022/Fig1figsupp3source data 1_figS3_data.mat`.
+   - Outputs: glomerular sparsity figures under `figures/manuscript/`.
 
-4-sparse_expansive_code.ipynb (Fig S7A): Following Babadi and Sompolinsky, use a random expansive code from glomeruli to cortical neurons. We fit logistic regression instead of a Hebbian learning rule.
+2. `1-all_decoding.ipynb`
+   - Generates Fig. 3B-F and Fig. S5.
+   - Inputs: model simulations from `odor_mix_code.coding_model_fanofactor`.
+   - Outputs: decoding result CSVs under `results/` and figures under `figures/`.
+   - Runtime note: this is the main simulation notebook and includes longer concentration/background/replicate sweeps. Existing CSVs are loaded for plotting by default; set `FORCE_RECOMPUTE = True` in the notebook to regenerate all decoding results.
 
-5-glom_data_sparsity.ipynb (3A, Fig S6): Computes Treves-Rolls sparsity from glomerular model at high and low concentrations, data collected in Zak et al. 2020 and Burton et al. 2022
+3. `2-glue_analysis.ipynb`
+   - Generates Fig. 4.
+   - Inputs: either the optional `gcmc` package for recomputation or the bundled fallback table:
+     `results/GLUE/glomerular_poisson_gcmc_withshuffle_24bg_high_low_scale_0.0_10000points.csv`.
+   - Outputs: GLUE capacity/dimension/radius figures under `figures/`.
 
-coding_model_fanofactor.py: core glomerular response functions for Fano factor-scaled Gaussian noise. Adapted from Reddy et al. 2018 [https://github.com/greddy992/Odor-mixtures]
+4. `4-sparse_expansive_code.ipynb`
+   - Generates Fig. S7A.
+   - Inputs: model simulations and, when `load_prior_result = True`, a previously generated
+     `results/OB_PiC_comparison/expansive_code_poisson.csv`.
+   - Outputs: sparse expansive code result CSVs under `results/OB_PiC_comparison/` and figures under `figures/manuscript/`.
+
+5. `3-OSN_PiC_data.ipynb`
+   - Generates Fig. S7B and computes response sparsity for Zak 2024 data.
+   - Inputs: `data/Zak_2024/`.
+   - Outputs: OSN/PiC decodability figures under `figures/manuscript/`.
+
+## GLUE Fallback
+
+The GLUE recomputation path imports `gcmc`, which may not be publicly installable in every environment. If `gcmc` is unavailable, skip the recomputation cell and run the plotting cells from the bundled CSV in `results/GLUE/`.
+
+## Generated Outputs
+
+Generated figures and newly generated results are ignored by Git. The only tracked file under `results/` is the bundled GLUE fallback CSV used for reviewer reproduction.
+
+## Compatibility Module
+
+`scripts/coding_model_fanofactor.py` is a shim for notebooks launched from the `scripts/` directory. New code should import from:
+
+```python
+from odor_mix_code.coding_model_fanofactor import *
+```
